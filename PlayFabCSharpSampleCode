@@ -1,0 +1,180 @@
+using System;
+using System.IO;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Azure.WebJobs;
+using Microsoft.Azure.WebJobs.Extensions.Http;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
+using Newtonsoft.Json;
+using PlayFab;
+using PlayFab.EconomyModels;
+using System.Collections.Generic;
+using System.Diagnostics;
+
+// 이 예제는 Playfab의 UnitySDK가 아닌, C#의 PlayFabAllSDK를 사용중임.
+// UnitySDK의 경우 Async를 지원하지 않기 때문.
+// 이 Azure Functions의 함수에서는 이미 클라이언트(유니티) 유저가 Item을 Draft한 상황이며,
+// Request의 파라미터로 Draft한 아이템의 ID와 Price라는 int 데이터를 함께 보낸것이 전제됨.
+// 더하여 Price의 경우 클라이언트에서 수정할 수 없으므로 아래의 함수처럼 반드시 서버인증키로 수정해야함.
+
+namespace CreateDoodleItem
+{
+    public static class SetPriceAndPublishDoodleItem
+    {
+        [FunctionName("SetPriceAndPublishDoodleItem")]
+        public static async Task<IActionResult> Run(
+            [HttpTrigger(AuthorizationLevel.Function, "get", "post", Route = null)] HttpRequest req,
+            ILogger log)
+        {
+            try
+            {	
+                const string TITLE_ID = "Please enter your Playfab Title ID";
+                // ServerOnlySecretKey
+                const string ServerKey = "Please enter your DevKey";
+
+                // PlayFab의 관지자 수준의 API를 사용하기 위해 사용됨.
+	    // 이는 관리자 수준으로 GetEntityTokenAsync()를 사용하기 위함임.
+                // 프로젝트 ID와 개발자 비밀키를 설정.
+                PlayFabSettings.staticSettings.TitleId = TITLE_ID;
+                PlayFabSettings.staticSettings.DeveloperSecretKey = ServerKey;
+
+                // 인증용 명세 작성
+	    // Playfab의 새로운 데이터 모델인 Entity를 사용중이라면 아래처럼 request인자를 추가하지않고 써야함.
+                PlayFab.AuthenticationModels.GetEntityTokenRequest request
+                        = new PlayFab.AuthenticationModels.GetEntityTokenRequest();
+
+                // 서버쪽은 따로 로그인이 없으므로,
+                // 이렇게 반드시 인증 토큰을 받아서 인증을 먼저 해야함.
+                var titleEntityResponse = await PlayFab.PlayFabAuthenticationAPI.GetEntityTokenAsync(request);
+
+                // 인증 실패시
+                if (titleEntityResponse.Result == null)
+                {
+                    // 인증 실패
+                    //log.LogInformation("인증 실패 : " + titleEntityResponse.Error.ErrorMessage);
+                    return new OkObjectResult("Auth Fail");
+                }
+
+                // 로그 출력 "인증 완료"
+                // log.LogInformation("인증 완료");
+
+	    // 클라이언트(유니티코드)에서 보낸 유저의 정보와 파라미터 정보를 수신하기위해
+	    // requestBody를 읽어오고, JsonConvert를 활용해 object형식으로 변환.
+                string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+                dynamic data = JsonConvert.DeserializeObject(requestBody);
+
+                // 로그 출력 requestBody
+                // log.LogInformation("requestBody : " + requestBody);
+
+
+                // 클라이언트(유니티 코드)에서 보낸 파라미터 값인 Draft된 아이템의 ID
+	    // 이때 받은 아이디로 아이템을 조회하여 아이템 정보를 불러와야함.
+	    // 왜냐하면 PlayFab.EconomyModels.UpdateDraftItemRequest()함수는
+	    // Patch(수정된 부분만 업데이트)가 아니라 PUT(다시작성)이기 때문임.
+                string draftedItemID = data?.FunctionArgument.DraftItemId;
+
+                // 클라이언트(유니티 코드)에서 보낸 파라미터 값인 Draft된 아이템에 설정할 가격
+                int price = data?.FunctionArgument.Price;
+
+                // 로그 출력 data
+                // log.LogInformation("가격 : " + price);
+
+	    // playFabEconomyInstanceAPI.UpdateDraftItemAsync() 사용 시,
+	    // 아이템을 제작한 사람의 Entity.Id와 Entity.Type이 필요함.
+                string callerID = data?.CallerEntityProfile.Entity.Id;
+                string callerType = data?.CallerEntityProfile.Entity.Type;
+
+
+                // 로그 출력
+                // log.LogInformation("ServerEntity Token : " + titleEntityResponse.Result.EntityToken);
+
+                // 아이템 조회
+	    // 이때 Entity는 아이템을 제작한 사람.
+	    // 이 예제 코드의 경우 아이템을 draft한 사람이 곧 아이템 제작자이기 때문에 클라이언트(유니티 코드)쪽의
+	    // 클라우드 스크립트를 실행한 사용자의 entity정보와 일치함.
+                PlayFabResult<GetDraftItemResponse> result = await PlayFabEconomyAPI.GetDraftItemAsync(new PlayFab.EconomyModels.GetDraftItemRequest()
+                {
+                    Id = draftedItemID,
+                    Entity = new PlayFab.EconomyModels.EntityKey()
+                    {
+                        Id = callerID,
+                        Type = callerType,
+                    },
+                });
+
+                // 검색 된 아이템을 수정하기 편하게 하기위해 CatalogItem 변수로 캐싱.
+                CatalogItem serchedItem = result.Result.Item;
+
+	    // 설명의 경우 draft당시 미리 설정한 key값만 수정 가능.
+                // serchedItem.Description["YourDictionaryKey"] = "서버에서 정보 수정 중";
+	
+	    // 가격 설정 부분
+                // 검색 된 아이템의 가격을 수정
+               serchedItem.PriceOptions.Prices = new List<CatalogPrice>(){ new CatalogPrice() { Amounts = new List<CatalogPriceAmount>() { new CatalogPriceAmount() { Amount = price, ItemId = "Please enter your item ID of currency(from CatalogV2)" } } } };
+
+
+
+                // 이코노미 타이틀 인증 완료 API 인스턴스
+	    // PlayFabEconomyAPI 정적메서드로 접근해도 상관없으나,
+	    // 이 예제에서는 PlayFabEconomyInstanceAPI를 통해 PlayFabApiSettings를 설정함.
+	    // 
+                PlayFabEconomyInstanceAPI playFabEconomyInstanceAPI = new PlayFabEconomyInstanceAPI(
+                    new PlayFabApiSettings
+                    {
+                        // 게임 타이틀의 ID
+                        TitleId = TITLE_ID,
+
+                    },
+                    new PlayFabAuthenticationContext
+                    {
+		// title수준의 Entity ID
+		// == GetEntityTokenAsync()를 통해 받아온 EntityId
+                        EntityId = titleEntityResponse.Result.Entity.Id,
+
+                        // title수준의 EntityToken
+		// == GetEntityTokenAsync()를 통해 받아온 EntityToken
+                        EntityToken = titleEntityResponse.Result.EntityToken,
+                    }
+                );
+
+
+                // 로그 출력 "저장 시도"
+                // log.LogInformation("저장 시도");
+
+
+                // DraftItem 가격 설정 및 퍼블리시
+                var response = await playFabEconomyInstanceAPI.UpdateDraftItemAsync(new PlayFab.EconomyModels.UpdateDraftItemRequest()
+                {
+                    // 수정한 아이템 정보
+                    Item = serchedItem,
+
+                    // 퍼블리싱으로 저장
+	        // flase로 하거나 수정하지 않으면, Draft로만 저장됨.
+                    Publish = true,
+                });
+
+                if (response.Error != null)
+                {
+
+                    // 로그 출력 "저장 실패"
+                    // log.LogInformation("저장 실패 : " + response.Error.ErrorMessage);
+                    return new OkObjectResult(response.Error.ErrorMessage);
+                }
+
+
+                // 로그 출력 "저장 성공"
+                // log.LogInformation("저장 성공");
+
+            }
+            catch (Exception e)
+            {
+                // log.LogInformation("저장 실패 : " + e.Message);
+                return new OkObjectResult(e.Message);
+            }
+
+            return new OkObjectResult("가격 책정 과정 끝");
+
+        }
+    }
+}
