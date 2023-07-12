@@ -1,0 +1,180 @@
+using System;
+using System.IO;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Azure.WebJobs;
+using Microsoft.Azure.WebJobs.Extensions.Http;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
+using Newtonsoft.Json;
+using PlayFab;
+using PlayFab.EconomyModels;
+using System.Collections.Generic;
+using System.Diagnostics;
+
+// This example uses the PlayFabAllSDK in C#, not the UnitySDK of Playfab.
+// Because the UnitySDK does not support Async.
+// In this function of Azure Functions, it is assumed that the client (Unity) user has already drafted an Item,
+// and that the ID of the item drafted and the int data of Price are sent together as parameters of the Request.
+// Furthermore, since the Price cannot be modified from the client, it must be modified with the server authentication key as in the function below.
+
+namespace CreateDoodleItem
+{
+    public static class SetPriceAndPublishDoodleItem
+    {
+        [FunctionName("SetPriceAndPublishDoodleItem")]
+        public static async Task<IActionResult> Run(
+            [HttpTrigger(AuthorizationLevel.Function, "get", "post", Route = null)] HttpRequest req,
+            ILogger log)
+        {
+            try
+            {   
+                const string TITLE_ID = "Please enter your Playfab Title ID";
+                // ServerOnlySecretKey
+                const string ServerKey = "Please enter your DevKey";
+
+                // Used to use the administrator-level API of PlayFab.
+                // This is for using GetEntityTokenAsync() at the administrator level.
+                // Set the project ID and developer secret key.
+                PlayFabSettings.staticSettings.TitleId = TITLE_ID;
+                PlayFabSettings.staticSettings.DeveloperSecretKey = ServerKey;
+
+                // Write the specification for authentication
+                // If you are using Entity, the new data model of Playfab, you should write it without adding the request argument as below.
+                PlayFab.AuthenticationModels.GetEntityTokenRequest request
+                        = new PlayFab.AuthenticationModels.GetEntityTokenRequest();
+
+                // Since there is no login on the server side,
+                // You must first authenticate by receiving the authentication token like this.
+                var titleEntityResponse = await PlayFab.PlayFabAuthenticationAPI.GetEntityTokenAsync(request);
+
+                // If authentication fails
+                if (titleEntityResponse.Result == null)
+                {
+                    // Authentication failed
+                    //log.LogInformation("Authentication failed : " + titleEntityResponse.Error.ErrorMessage);
+                    return new OkObjectResult("Auth Fail");
+                }
+
+                // Log output "Authentication complete"
+                // log.LogInformation("Authentication complete");
+
+                // To receive the user information and parameter information sent from the client (Unity code),
+                // Read the requestBody and convert it to an object type using JsonConvert.
+                string requestBody = await new StreamReader(req.Body).ReadToEndAsync();
+                dynamic data = JsonConvert.DeserializeObject(requestBody);
+
+                // Log output requestBody
+                // log.LogInformation("requestBody : " + requestBody);
+
+
+                // The parameter value of the Drafted item ID sent from the client (Unity code)
+                // You need to retrieve the item information with the ID received at this time.
+                // This is because the PlayFab.EconomyModels.UpdateDraftItemRequest() function is
+                // not Patch (update only the modified part), but PUT (rewrite).
+                string draftedItemID = data?.FunctionArgument.DraftItemId;
+
+                // The parameter value of the price to be set for the Drafted item sent from the client (Unity code)
+                int price = data?.FunctionArgument.Price;
+
+                // Log output data
+                // log.LogInformation("Price : " + price);
+
+                // When using playFabEconomyInstanceAPI.UpdateDraftItemAsync(),
+                // You need the Entity.Id and Entity.Type of the person who made the item.
+                string callerID = data?.CallerEntityProfile.Entity.Id;
+                string callerType = data?.CallerEntityProfile.Entity.Type;
+
+
+                // Log output
+                // log.LogInformation("ServerEntity Token : " + titleEntityResponse.Result.EntityToken);
+
+                // Item inquiry
+                // The Entity here is the person who made the item.
+                // In this example code, since the person who drafted the item is the item maker, the client (Unity code) side
+                // It matches the entity information of the user who executed the cloud script.
+                PlayFabResult<GetDraftItemResponse> result = await PlayFabEconomyAPI.GetDraftItemAsync(new PlayFab.EconomyModels.GetDraftItemRequest()
+                {
+                    Id = draftedItemID,
+                    Entity = new PlayFab.EconomyModels.EntityKey()
+                    {
+                        Id = callerID,
+                        Type = callerType,
+                    },
+                });
+
+                // To make it easier to modify the item found, cache it as a CatalogItem variable.
+                CatalogItem serchedItem = result.Result.Item;
+
+                // In the case of description, only the key value set in advance at the time of draft can be modified.
+                // serchedItem.Description["NEUTRAL"] = "Modifying information on the server";
+        
+                // Part of price setting
+                // Modify the price of the item found
+               serchedItem.PriceOptions.Prices = new List<CatalogPrice>(){ new CatalogPrice() { Amounts = new List<CatalogPriceAmount>() { new CatalogPriceAmount() { Amount = price, ItemId = "Please enter your item ID of currency(from CatalogV2)" } } } };
+
+
+
+                // Completed authentication of economic title API instance
+                // Although you can access the PlayFabEconomyAPI static method, 
+                // In this example, we set PlayFabApiSettings through PlayFabEconomyInstanceAPI.
+
+                PlayFabEconomyInstanceAPI playFabEconomyInstanceAPI = new PlayFabEconomyInstanceAPI(
+                    new PlayFabApiSettings
+                    {
+                        // ID of the game title
+                        TitleId = TITLE_ID,
+
+                    },
+                    new PlayFabAuthenticationContext
+                    {
+                        // Entity ID at the title level
+                        // == EntityId received through GetEntityTokenAsync()
+                        EntityId = titleEntityResponse.Result.Entity.Id,
+
+                        // EntityToken at the title level
+                        // == EntityToken received through GetEntityTokenAsync()
+                        EntityToken = titleEntityResponse.Result.EntityToken,
+                    }
+                );
+
+
+                // Log output "Attempting to save"
+                // log.LogInformation("Attempting to save");
+
+
+                // Set the price of DraftItem and publish
+                var response = await playFabEconomyInstanceAPI.UpdateDraftItemAsync(new PlayFab.EconomyModels.UpdateDraftItemRequest()
+                {
+                    // Modified item information
+                    Item = serchedItem,
+
+                    // Save as publishing
+                    // If you do not modify it or make it false, it will only be saved as Draft.
+                    Publish = true,
+                });
+
+                if (response.Error != null)
+                {
+
+                    // Log output "Save failed"
+                    // log.LogInformation("Save failed : " + response.Error.ErrorMessage);
+                    return new OkObjectResult(response.Error.ErrorMessage);
+                }
+
+
+                // Log output "Save successful"
+                // log.LogInformation("Save successful");
+
+            }
+            catch (Exception e)
+            {
+                // log.LogInformation("Save failed : " + e.Message);
+                return new OkObjectResult(e.Message);
+            }
+
+            return new OkObjectResult("Price determination process ends");
+
+        }
+    }
+}
